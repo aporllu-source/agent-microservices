@@ -2,45 +2,38 @@ import Fastify from "fastify";
 import rateLimit from "@fastify/rate-limit";
 import crypto from "crypto";
 import { checkWebEntityStatus } from "./checker.js";
-import {
-  addApiKey,
-  hasApiKey,
-  getFreeUntil,
-  setFreeUntil,
-  recordUsage,
-  getUsageForKey,
-  getUsageSnapshot
-} from "./store.js";
+import { createApiKey, getApiKey, decrementCredit, addCredits } from "./store_pg.js";
 
 const app = Fastify({ logger: true });
 
-// --------------------
-// Config global
-// --------------------
-const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hora
-const FREE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
-const API_KEY_RPM = 120;               // 120 req/min por API key
-const API_KEY_DAILY_LIMIT = 1000;      // <-- PRICING REAL: cambia este número
+// ====================
+// CONFIG
+// ====================
+const CACHE_TTL_MS = 60 * 60 * 1000;     // 1h
+const API_KEY_RPM = 120;                 // req/min por API key
+const DEFAULT_INITIAL_CREDITS = 1000;    // créditos al crear una key (ajústalo)
+const COST_PER_CALL = 1;                 // 1 crédito por llamada
 
-const cache = new Map(); // url -> { data, expiresAt }
+const cache = new Map();                 // url -> { data, expiresAt }
+const apiKeyRate = new Map();            // "key:bucket" -> count
 
-// --------------------
-// Rate limit por IP (protección básica)
-// --------------------
+// ====================
+// RATE LIMIT IP
+// ====================
 await app.register(rateLimit, {
   max: 60,
   timeWindow: "1 minute",
   keyGenerator: (req) => req.ip
 });
 
-// --------------------
-// Healthcheck
-// --------------------
+// ====================
+// HEALTH
+// ====================
 app.get("/health", async () => ({ ok: true }));
 
-// --------------------
-// Catálogo
-// --------------------
+// ====================
+// CATALOG
+// ====================
 app.get("/catalog.json", async () => ({
   version: "1.0",
   updated_at: new Date().toISOString(),
@@ -50,54 +43,117 @@ app.get("/catalog.json", async () => ({
       description: "Checks if a web entity exists, is reachable, and appears legitimate.",
       endpoint: "/v1/web-entity-status",
       method: "POST",
-      pricing: { model: "per_call", first_call: "free", cost_eur: 0.40 },
-      limits: {
-        free_tier: "1 call / 24h per IP",
-        api_key_daily: API_KEY_DAILY_LIMIT
+      pricing: {
+        model: "credits",
+        cost_per_call_credits: COST_PER_CALL
       },
       rate_limits: {
-        ip: "60 calls / minute",
-        api_key: `${API_KEY_RPM} calls / minute`
+        ip: "60/min",
+        api_key: `${API_KEY_RPM}/min`
       },
-      latency_ms: { typical: "200-800", max: 4500 },
       inputs: { url: { type: "string", required: true, example: "https://example.com" } },
       outputs: [
         "exists","reachable","http_status","final_url","ssl_valid",
         "suspected_parked_domain","confidence_score","checked_at"
       ],
-      auth: { header: "x-api-key", obtain_key: "POST /v1/api-keys" }
+      auth: { header: "x-api-key" }
     }
   ]
 }));
 
-// --------------------
-// Crear API key (persistente)
-// --------------------
-app.post("/v1/api-keys", async () => {
-  const apiKey = "ak_" + crypto.randomBytes(24).toString("hex");
-  addApiKey(apiKey);
-  return { api_key: apiKey, daily_limit: API_KEY_DAILY_LIMIT };
+// ====================
+// CREATE API KEY (PROTECTED)
+// body: { credits?: number }
+// ====================
+app.post("/v1/api-keys", {
+  schema: {
+    body: {
+      type: "object",
+      properties: {
+        credits: { type: "integer", minimum: 0, maximum: 100000000 }
+      }
+    }
+  }
+}, async (req, reply) => {
+  const provisionKey = process.env.PROVISION_KEY || "";
+  const header = (req.headers["x-provision-key"] || "").toString();
+
+  if (!provisionKey || header !== provisionKey) {
+    reply.code(403);
+    return { error: { code: "FORBIDDEN", message: "Missing or invalid x-provision-key" } };
+  }
+
+  const initialCredits =
+    typeof req.body?.credits === "number" ? req.body.credits : DEFAULT_INITIAL_CREDITS;
+
+  const created = await createApiKey({ credits: initialCredits });
+  return { api_key: created.key, credits_remaining: created.credits_remaining };
 });
 
-// --------------------
-// Admin: ver usage (protegido)
-// Header: x-admin-key: <ADMIN_KEY>
-// --------------------
-app.get("/v1/admin/usage", async (req, reply) => {
+// ====================
+// ADMIN: list keys (PROTECTED)
+// ====================
+app.get("/v1/admin/api-keys", async (req, reply) => {
   const adminKey = process.env.ADMIN_KEY || "";
   const header = (req.headers["x-admin-key"] || "").toString();
 
   if (!adminKey || header !== adminKey) {
     reply.code(403);
-    return { error: { code: "FORBIDDEN", message: "Missing or invalid x-admin-key" } };
+    return { error: { code: "FORBIDDEN", message: "Invalid x-admin-key" } };
   }
 
-  return { ok: true, usage: getUsageSnapshot() };
+  // lista simple: (ojo: en store_pg.js no tenemos función de listar; lo hacemos aquí)
+  const { pool } = await import("./db.js");
+  const { rows } = await pool.query(
+    `SELECT id, key, credits_remaining, active, created_at
+     FROM api_keys
+     ORDER BY id DESC
+     LIMIT 200`
+  );
+
+  return { ok: true, items: rows };
 });
 
-// --------------------
-// Micro-servicio principal
-// --------------------
+// ====================
+// ADMIN: topup credits (PROTECTED)
+// body: { api_key: string, amount: number }
+// ====================
+app.post("/v1/admin/topup", {
+  schema: {
+    body: {
+      type: "object",
+      required: ["api_key", "amount"],
+      properties: {
+        api_key: { type: "string", minLength: 5, maxLength: 200 },
+        amount: { type: "integer", minimum: 1, maximum: 100000000 }
+      }
+    }
+  }
+}, async (req, reply) => {
+  const adminKey = process.env.ADMIN_KEY || "";
+  const header = (req.headers["x-admin-key"] || "").toString();
+
+  if (!adminKey || header !== adminKey) {
+    reply.code(403);
+    return { error: { code: "FORBIDDEN", message: "Invalid x-admin-key" } };
+  }
+
+  const k = await getApiKey(req.body.api_key);
+  if (!k) {
+    reply.code(404);
+    return { error: { code: "NOT_FOUND", message: "API key not found or inactive" } };
+  }
+
+  await addCredits(k.id, req.body.amount, "admin_topup");
+
+  const k2 = await getApiKey(req.body.api_key);
+  return { ok: true, credits_remaining: k2.credits_remaining };
+});
+
+// ====================
+// MAIN SERVICE
+// POST /v1/web-entity-status
+// ====================
 app.post("/v1/web-entity-status", {
   schema: {
     body: {
@@ -112,103 +168,87 @@ app.post("/v1/web-entity-status", {
   const requestId = "req_" + crypto.randomBytes(10).toString("hex");
 
   try {
-    const headerKey = (req.headers["x-api-key"] || "").toString().trim();
-    const hasApiKeyHeader = headerKey.length > 0;
-    const hasValidApiKey = hasApiKeyHeader && hasApiKey(headerKey);
-
-    // 0️⃣ LÍMITE DIARIO (pricing real)
-    if (hasValidApiKey) {
-      const u = getUsageForKey(headerKey); // normaliza el día (resetea calls_today si cambia)
-      if (u && u.calls_today >= API_KEY_DAILY_LIMIT) {
-        reply.code(402);
-        return {
-          error: {
-            code: "DAILY_LIMIT_REACHED",
-            message: "Daily limit reached for this API key. Contact support to upgrade."
-          },
-          limits: {
-            daily_limit: API_KEY_DAILY_LIMIT,
-            calls_today: u.calls_today
-          },
-          request_id: requestId
-        };
-      }
+    const apiKey = (req.headers["x-api-key"] || "").toString().trim();
+    if (!apiKey) {
+      reply.code(401);
+      return { error: { code: "UNAUTHORIZED", message: "Missing x-api-key" }, request_id: requestId };
     }
 
-    // Rate limit por API key (120/min) — MVP in-memory
-    if (hasValidApiKey) {
-      const bucket = Math.floor(Date.now() / 60000);
-      const key = `rl:${headerKey}:${bucket}`;
-
-      if (!app.__rl) app.__rl = new Map();
-      const m = app.__rl;
-
-      const n = (m.get(key) || 0) + 1;
-      m.set(key, n);
-
-      if (n > API_KEY_RPM) {
-        reply.code(429);
-        return {
-          error: { code: "RATE_LIMITED", message: "API key rate limit exceeded" },
-          request_id: requestId
-        };
-      }
+    const keyRow = await getApiKey(apiKey);
+    if (!keyRow) {
+      reply.code(401);
+      return { error: { code: "UNAUTHORIZED", message: "Invalid API key" }, request_id: requestId };
     }
 
-    // 1️⃣ FIRST CALL FREE (persistente por IP) — si no hay API key válida
-    const ip = req.ip;
-    const freeUntil = getFreeUntil(ip);
-    const hasFreeAvailable = !freeUntil || freeUntil <= Date.now();
+    // ---- API KEY RATE LIMIT (RPM)
+    const bucket = Math.floor(Date.now() / 60000);
+    const rlKey = `${apiKey}:${bucket}`;
+    const n = (apiKeyRate.get(rlKey) || 0) + 1;
+    apiKeyRate.set(rlKey, n);
+    if (n > API_KEY_RPM) {
+      reply.code(429);
+      return { error: { code: "RATE_LIMITED", message: "API key rate limit exceeded" }, request_id: requestId };
+    }
 
-    if (!hasValidApiKey && !hasFreeAvailable) {
+    // ---- CREDIT CHECK
+    if (keyRow.credits_remaining < COST_PER_CALL) {
       reply.code(402);
       return {
-        error: {
-          code: "PAYMENT_REQUIRED",
-          message: "Free quota used for this IP. Create an API key via POST /v1/api-keys and send it as x-api-key."
-        },
+        error: { code: "OUT_OF_CREDITS", message: "Not enough credits. Top up to continue." },
+        credits_remaining: keyRow.credits_remaining,
         request_id: requestId
       };
     }
 
-    if (!hasValidApiKey && hasFreeAvailable) {
-      setFreeUntil(ip, Date.now() + FREE_TTL_MS);
-    }
-
-    // 2️⃣ CACHE por URL
+    // ---- CACHE
     const cacheKey = req.body.url;
     const cached = cache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
-      if (hasValidApiKey) recordUsage(headerKey);
+      // cobramos igualmente (lo normal en APIs de verificación)
+      const ok = await decrementCredit(keyRow.id);
+      if (!ok) {
+        reply.code(402);
+        return {
+          error: { code: "OUT_OF_CREDITS", message: "Not enough credits. Top up to continue." },
+          credits_remaining: 0,
+          request_id: requestId
+        };
+      }
+
       return { ...cached.data, cached: true, request_id: requestId };
     }
 
-    // 3️⃣ CHECKER
+    // ---- CHECK
     const result = await checkWebEntityStatus(req.body.url);
 
-    // 4️⃣ GUARDAR EN CACHE
+    // ---- STORE CACHE
     cache.set(cacheKey, { data: result, expiresAt: Date.now() + CACHE_TTL_MS });
 
-    // 5️⃣ LOG USAGE (solo si API key válida)
-    if (hasValidApiKey) recordUsage(headerKey);
+    // ---- DECREMENT CREDIT (after successful check)
+    const ok = await decrementCredit(keyRow.id);
+    if (!ok) {
+      reply.code(402);
+      return {
+        error: { code: "OUT_OF_CREDITS", message: "Not enough credits. Top up to continue." },
+        credits_remaining: 0,
+        request_id: requestId
+      };
+    }
 
     return { ...result, request_id: requestId };
 
   } catch (err) {
     req.log.error({ err }, "web_entity_status_failed");
     reply.code(400);
-    return {
-      error: { code: "BAD_REQUEST", message: err?.message || "Invalid request" },
-      request_id: requestId
-    };
+    return { error: { code: "BAD_REQUEST", message: err?.message || "Invalid request" }, request_id: requestId };
   }
 });
 
-// --------------------
-// Arranque
-// --------------------
+// ====================
+// START
+// ====================
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
-const HOST = process.env.HOST || "0.0.0.0";
+const HOST = "0.0.0.0";
 
 app.listen({ port: PORT, host: HOST });
 
