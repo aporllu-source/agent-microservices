@@ -10,6 +10,7 @@
   "dependencies": {
     "@fastify/rate-limit": "^9.1.0",
     "fastify": "^4.28.1",
-    "node-fetch": "^2.6.12"
+    "node-fetch": "^2.6.12",
+    "pg": "^8.18.0"
   }
 }
